@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="card">
+<h2>Admin Panel</h2>
+<p>Total VPS: {{ vpses|length }} · Total Users: {{ users|length }}</p>
+</div>
+
+<div class="card">
+<h3>Active VPSes</h3>
+<table>
+<tr><th>User</th><th>Container</th><th>CPU</th><th>RAM</th><th>Status</th><th>Actions</th></tr>
+{% for v in vpses %}
+<tr>
+  <td>{{ v.username }}<br><small>{{ v.email }}</small></td>
+  <td><code>{{ v.container_id[:12] }}</code></td>
+  <td>{{ v.cpu }}%</td>
+  <td>{{ v.ram }} MB</td>
+  <td>{{ v.status }}</td>
+  <td>
+    {% if v.status == 'running' %}
+      <form method="post" action="/admin/suspend/{{ v.id }}"><button class="btn-warn">Suspend</button></form>
+    {% else %}
+      <form method="post" action="/admin/resume/{{ v.id }}"><button>Resume</button></form>
+    {% endif %}
+    <form method="post" action="/admin/delete/{{ v.id }}" onsubmit="return confirm('Delete VPS?')"><button class="btn-danger">Delete</button></form>
+  </td>
+</tr>
+{% endfor %}
+</table>
+</div>
+
+<div class="card">
+<h3>Users</h3>
+<table>
+<tr><th>ID</th><th>Username</th><th>Email</th><th>Admin</th><th>Signup IP</th><th>Created</th><th></th></tr>
+{% for u in users %}
+<tr>
+  <td>{{ u.id }}</td>
+  <td>{{ u.username }}</td>
+  <td>{{ u.email }}</td>
+  <td>{{ 'Yes' if u.is_admin else 'No' }}</td>
+  <td>{{ u.signup_ip }}</td>
+  <td>{{ u.created_at }}</td>
+  <td><form method="post" action="/admin/user/delete/{{ u.id }}" onsubmit="return confirm('Delete user + VPS?')"><button class="btn-danger">Del</button></form></td>
+</tr>
+{% endfor %}
+</table>
+</div>
+{% endblock %}
