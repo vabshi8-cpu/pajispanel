@@ -282,6 +282,25 @@ def get_container_stats(container_id, created_at=None):
     }
 
 
+def stats(container_id):
+    """
+    Alias for monitor.py: same data as get_container_stats, but keyed as
+    'cpu' (percent) since that's the field name monitor.py's watch() loop checks.
+    """
+    s = get_container_stats(container_id)
+    return {
+        "cpu": s["cpu_percent"],
+        "mem_percent": s["mem_percent"],
+        "mem_usage_mb": s["mem_usage_mb"],
+        "mem_limit_mb": s["mem_limit_mb"],
+    }
+
+
+def suspend(container_id):
+    """Alias for monitor.py's naming."""
+    return suspend_vps(container_id)
+
+
 def build_logs_stream(container_id):
     """
     Generator yielding decoded log lines as they arrive.
