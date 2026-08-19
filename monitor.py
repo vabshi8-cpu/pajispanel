@@ -22,6 +22,6 @@ def watch():
             print(f"[MONITOR] err: {e}")
         time.sleep(15)
 
-def start():
+def start_monitor():
     t = threading.Thread(target=watch, daemon=True)
     t.start()
