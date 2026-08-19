@@ -1,0 +1,44 @@
+<!doctype html>
+<html>
+<head>
+<title>VPS Panel</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:0}
+.nav{background:#1a1a1a;padding:12px 20px;border-bottom:1px solid #333;display:flex;justify-content:space-between}
+.nav a{color:#4af;text-decoration:none;margin-right:15px}
+.container{max-width:900px;margin:30px auto;padding:0 20px}
+.card{background:#1a1a1a;border:1px solid #333;padding:20px;border-radius:6px;margin-bottom:15px}
+input,button{padding:8px 12px;background:#222;color:#eee;border:1px solid #444;border-radius:4px;font-size:14px}
+button{background:#4af;color:#000;cursor:pointer;border:none;font-weight:600}
+button:hover{background:#6bf}
+.btn-danger{background:#e55;color:#fff}
+.btn-warn{background:#fa3;color:#000}
+.flash{background:#332;padding:10px;border-left:3px solid #fa3;margin-bottom:10px}
+table{width:100%;border-collapse:collapse}
+th,td{padding:8px;border-bottom:1px solid #333;text-align:left;font-size:13px}
+.log{background:#000;color:#0f0;font-family:monospace;padding:15px;height:300px;overflow-y:auto;border-radius:4px;font-size:12px}
+.stat{display:inline-block;margin-right:20px}
+.stat b{color:#4af}
+form{display:inline}
+</style>
+</head>
+<body>
+<div class="nav">
+  <div><b>VPS Panel</b></div>
+  <div>
+    {% if session.uid %}
+      {% if session.is_admin %}<a href="/admin">Admin</a>{% else %}<a href="/dashboard">Dashboard</a>{% endif %}
+      <a href="/logout">Logout</a>
+    {% else %}
+      <a href="/login">Login</a><a href="/register">Register</a>
+    {% endif %}
+  </div>
+</div>
+<div class="container">
+  {% with msgs = get_flashed_messages() %}
+    {% for m in msgs %}<div class="flash">{{ m }}</div>{% endfor %}
+  {% endwith %}
+  {% block body %}{% endblock %}
+</div>
+</body>
+</html>
