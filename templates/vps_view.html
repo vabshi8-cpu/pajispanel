@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="card">
+<h2>Building your VPS...</h2>
+<div class="log" id="log"></div>
+</div>
+<script>
+const log = document.getElementById('log');
+const es = new EventSource('/logs');
+es.onmessage = e => {
+  if(e.data === '[DONE]'){
+    es.close();
+    setTimeout(()=>location.href='/dashboard', 1000);
+    return;
+  }
+  const line = document.createElement('div');
+  line.textContent = e.data;
+  log.appendChild(line);
+  log.scrollTop = log.scrollHeight;
+};
+</script>
+{% endblock %}
