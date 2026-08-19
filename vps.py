@@ -1,108 +1,192 @@
-import docker, time, re, subprocess
+import docker
+import subprocess
+import secrets
+import string
+from docker.errors import NotFound, APIError
 
 client = docker.from_env()
-IMAGE = "ubuntu:22.04"
 
-# 32GB RAM, 4 cores, 80GB disk
-MEM = "32g"
-CPUS = 4.0
-DISK = "80G"
+def generate_password(length=16):
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
 
-def create_vps(username, log_cb):
-    log_cb("[+] Allocating resources...")
-    time.sleep(0.5)
-    log_cb(f"[+] Requesting {MEM} RAM, {int(CPUS)} vCPU, {DISK} disk")
-    time.sleep(0.5)
-    log_cb("[+] Pulling base image...")
+def get_container(container_id):
+    try:
+        return client.containers.get(container_id)
+    except NotFound:
+        return None
 
-    name = f"vps_{username}_{int(time.time())}"
+def create_vps(username, cpu_limit=1, ram_limit_mb=1024, disk_limit_gb=10, image="ubuntu-vps:latest"):
+    """
+    Create a VPS container with LXCFS mounts so /proc and /sys reflect
+    container limits instead of host specs.
+    """
+    password = generate_password()
+    container_name = f"vps_{username}_{secrets.token_hex(4)}"
+
+    # LXCFS mounts — this is the fix for neofetch/free/df showing host specs
+    lxcfs_binds = {
+        '/var/lib/lxcfs/proc/cpuinfo': {'bind': '/proc/cpuinfo', 'mode': 'rw'},
+        '/var/lib/lxcfs/proc/diskstats': {'bind': '/proc/diskstats', 'mode': 'rw'},
+        '/var/lib/lxcfs/proc/meminfo': {'bind': '/proc/meminfo', 'mode': 'rw'},
+        '/var/lib/lxcfs/proc/stat': {'bind': '/proc/stat', 'mode': 'rw'},
+        '/var/lib/lxcfs/proc/swaps': {'bind': '/proc/swaps', 'mode': 'rw'},
+        '/var/lib/lxcfs/proc/uptime': {'bind': '/proc/uptime', 'mode': 'rw'},
+        '/var/lib/lxcfs/proc/loadavg': {'bind': '/proc/loadavg', 'mode': 'rw'},
+        '/var/lib/lxcfs/sys/devices/system/cpu/online': {'bind': '/sys/devices/system/cpu/online', 'mode': 'rw'},
+    }
+
     try:
         container = client.containers.run(
-            IMAGE,
-            name=name,
+            image,
             detach=True,
+            name=container_name,
+            hostname=username,
             tty=True,
             stdin_open=True,
-            mem_limit=MEM,
-            nano_cpus=int(CPUS * 1e9),
-            storage_opt={"size": DISK} if _supports_storage_opt() else None,
-            command="/bin/bash",
+            cpu_quota=int(cpu_limit * 100000),
+            cpu_period=100000,
+            mem_limit=f"{ram_limit_mb}m",
+            memswap_limit=f"{ram_limit_mb}m",
+            storage_opt={"size": f"{disk_limit_gb}G"} if _supports_storage_opt() else None,
+            volumes=lxcfs_binds,
             cap_add=["NET_ADMIN"],
+            security_opt=["no-new-privileges"],
+            restart_policy={"Name": "unless-stopped"},
+            environment={
+                "ROOT_PASSWORD": password,
+                "USERNAME": username,
+            },
+            command="/usr/sbin/sshd -D",
+            ports={'22/tcp': None},  # random host port
         )
-    except TypeError:
-        container = client.containers.run(
-            IMAGE, name=name, detach=True, tty=True, stdin_open=True,
-            mem_limit=MEM, nano_cpus=int(CPUS * 1e9), command="/bin/bash",
-        )
 
-    log_cb(f"[+] Container {container.short_id} created")
-    log_cb("[+] Installing tmate...")
-    container.exec_run("apt-get update -qq", tty=True)
-    container.exec_run("apt-get install -y tmate openssh-client -qq", tty=True)
-    log_cb("[+] Starting tmate session...")
+        container.reload()
+        ssh_port = _get_ssh_port(container)
 
-    container.exec_run("tmate -F -S /tmp/tmate.sock new-session -d", detach=True)
-    time.sleep(4)
-    container.exec_run("tmate -S /tmp/tmate.sock wait tmate-ready")
-    result = container.exec_run("tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}'")
-    ssh = result.output.decode().strip()
+        # Set root password inside container
+        _set_root_password(container, password)
 
-    log_cb(f"[+] SSH ready: {ssh}")
-    log_cb("[+] Deployment complete.")
-    return container.id, ssh
+        return {
+            "container_id": container.id,
+            "container_name": container_name,
+            "ssh_port": ssh_port,
+            "password": password,
+            "status": "running"
+        }
+    except APIError as e:
+        return {"error": str(e)}
 
 def _supports_storage_opt():
+    """Check if docker storage driver supports size quota (overlay2 with xfs pquota)."""
     try:
         info = client.info()
-        return info.get("Driver") in ("overlay2", "btrfs", "zfs", "devicemapper")
+        driver = info.get("Driver", "")
+        return driver == "overlay2"
     except Exception:
         return False
 
-def stats(container_id):
+def _get_ssh_port(container):
     try:
-        c = client.containers.get(container_id)
-        if c.status != "running":
-            return {"status": c.status, "cpu": 0, "ram": 0, "uptime": 0}
-        s = c.stats(stream=False)
-        cpu_delta = s["cpu_stats"]["cpu_usage"]["total_usage"] - s["precpu_stats"]["cpu_usage"]["total_usage"]
-        sys_delta = s["cpu_stats"].get("system_cpu_usage", 0) - s["precpu_stats"].get("system_cpu_usage", 0)
-        cpu_pct = 0.0
-        if sys_delta > 0 and cpu_delta > 0:
-            n = len(s["cpu_stats"]["cpu_usage"].get("percpu_usage", [1]))
-            cpu_pct = (cpu_delta / sys_delta) * n * 100.0
-        ram_used = s["memory_stats"].get("usage", 0) / (1024 * 1024)
-        ram_lim = s["memory_stats"].get("limit", 1) / (1024 * 1024)
-        started = c.attrs["State"]["StartedAt"]
-        return {
-            "status": "running",
-            "cpu": round(cpu_pct, 2),
-            "ram": round(ram_used, 1),
-            "ram_limit": round(ram_lim, 1),
-            "uptime": started,
-        }
+        ports = container.attrs["NetworkSettings"]["Ports"]
+        return int(ports["22/tcp"][0]["HostPort"])
+    except (KeyError, TypeError, IndexError):
+        return None
+
+def _set_root_password(container, password):
+    try:
+        container.exec_run(f"bash -c 'echo root:{password} | chpasswd'", user="root")
     except Exception as e:
-        return {"status": "error", "cpu": 0, "ram": 0, "uptime": 0, "error": str(e)}
+        print(f"Failed setting password: {e}")
 
-def suspend(container_id):
-    try:
-        c = client.containers.get(container_id)
-        c.pause()
-        return True
-    except Exception:
-        return False
+def start_vps(container_id):
+    c = get_container(container_id)
+    if not c:
+        return {"error": "not found"}
+    c.start()
+    return {"status": "started"}
 
-def resume(container_id):
-    try:
-        c = client.containers.get(container_id)
-        c.unpause()
-        return True
-    except Exception:
-        return False
+def stop_vps(container_id):
+    c = get_container(container_id)
+    if not c:
+        return {"error": "not found"}
+    c.stop(timeout=10)
+    return {"status": "stopped"}
 
-def destroy(container_id):
+def restart_vps(container_id):
+    c = get_container(container_id)
+    if not c:
+        return {"error": "not found"}
+    c.restart(timeout=10)
+    return {"status": "restarted"}
+
+def delete_vps(container_id):
+    c = get_container(container_id)
+    if not c:
+        return {"error": "not found"}
     try:
-        c = client.containers.get(container_id)
-        c.remove(force=True)
-        return True
+        c.stop(timeout=5)
     except Exception:
-        return False
+        pass
+    c.remove(force=True)
+    return {"status": "deleted"}
+
+def regenerate_ssh(container_id):
+    """Generate a new password and reset SSH host keys inside container."""
+    c = get_container(container_id)
+    if not c:
+        return {"error": "not found"}
+
+    new_password = generate_password()
+
+    try:
+        # Reset root password
+        c.exec_run(f"bash -c 'echo root:{new_password} | chpasswd'", user="root")
+
+        # Regenerate SSH host keys
+        c.exec_run("rm -f /etc/ssh/ssh_host_*", user="root")
+        c.exec_run("ssh-keygen -A", user="root")
+
+        # Restart sshd (kill + let container restart policy handle, or exec restart)
+        c.exec_run("bash -c 'pkill sshd; /usr/sbin/sshd -D &'", user="root", detach=True)
+
+        c.reload()
+        ssh_port = _get_ssh_port(c)
+
+        return {
+            "status": "regenerated",
+            "password": new_password,
+            "ssh_port": ssh_port
+        }
+    except APIError as e:
+        return {"error": str(e)}
+
+def get_vps_status(container_id):
+    c = get_container(container_id)
+    if not c:
+        return {"status": "not_found"}
+    c.reload()
+    return {
+        "status": c.status,
+        "ssh_port": _get_ssh_port(c),
+        "name": c.name,
+    }
+
+def list_all_vps():
+    containers = client.containers.list(all=True, filters={"name": "vps_"})
+    return [{
+        "id": c.id,
+        "name": c.name,
+        "status": c.status,
+        "ssh_port": _get_ssh_port(c),
+    } for c in containers]
+
+def exec_in_vps(container_id, cmd):
+    c = get_container(container_id)
+    if not c:
+        return {"error": "not found"}
+    result = c.exec_run(cmd, user="root")
+    return {
+        "exit_code": result.exit_code,
+        "output": result.output.decode(errors="replace")
+    }
