@@ -1,35 +1,64 @@
-import sqlite3, threading, queue, secrets, os
-from flask import Flask, render_template, request, redirect, url_for, session, jsonify, flash, Response
+import os, sqlite3, time, secrets, threading
+from flask import Flask, request, render_template, redirect, url_for, jsonify, session, Response, stream_with_context
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
-import setup, vps, monitor
+from werkzeug.middleware.proxy_fix import ProxyFix
+from vps import create_vps_container, destroy_vps, suspend_vps, unsuspend_vps, regen_tmate, get_container_stats, build_logs_stream
+from monitor import start_monitor
+
+app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+app.secret_key = secrets.token_hex(32)
 
 DB = "panel.db"
-app = Flask(__name__)
-app.secret_key = secrets.token_hex(16)
+login_manager = LoginManager(app)
+login_manager.login_view = "login"
 
-setup.init()
-monitor.start()
+def get_db():
+    db = sqlite3.connect(DB)
+    db.row_factory = sqlite3.Row
+    return db
 
-BUILD_LOGS = {}  # user_id -> queue
+def init_db():
+    db = get_db()
+    db.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        signup_ip TEXT NOT NULL,
+        is_admin INTEGER DEFAULT 0,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS vps (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER UNIQUE NOT NULL,
+        container_id TEXT NOT NULL,
+        ssh_command TEXT,
+        status TEXT DEFAULT 'creating',
+        creator_ip TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_regen INTEGER DEFAULT 0,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+    """)
+    db.commit()
+    db.close()
 
-def db():
-    c = sqlite3.connect(DB)
-    c.row_factory = sqlite3.Row
-    return c
+class User(UserMixin):
+    def __init__(self, row):
+        self.id = row["id"]
+        self.username = row["username"]
+        self.is_admin = bool(row["is_admin"])
 
-def client_ip():
-    return request.headers.get("X-Forwarded-For", request.remote_addr).split(",")[0].strip()
-
-def current_user():
-    if "uid" not in session: return None
-    con = db()
-    u = con.execute("SELECT * FROM users WHERE id=?", (session["uid"],)).fetchone()
-    con.close()
-    return u
+@login_manager.user_loader
+def load_user(uid):
+    row = get_db().execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    return User(row) if row else None
 
 @app.route("/")
 def index():
-    if current_user():
+    if current_user.is_authenticated:
         return redirect(url_for("dashboard"))
     return redirect(url_for("login"))
 
@@ -38,21 +67,15 @@ def register():
     if request.method == "POST":
         u = request.form["username"].strip()
         p = request.form["password"]
-        e = request.form.get("email", "").strip()
-        if len(u) < 3 or len(p) < 4:
-            flash("Username 3+ chars, password 4+ chars.")
-            return redirect(url_for("register"))
-        con = db()
-        try:
-            con.execute("INSERT INTO users(username,password,email,signup_ip) VALUES(?,?,?,?)",
-                        (u, generate_password_hash(p), e, client_ip()))
-            con.commit()
-        except sqlite3.IntegrityError:
-            flash("Username already taken.")
-            con.close()
-            return redirect(url_for("register"))
-        con.close()
-        flash("Account created. Login now.")
+        ip = request.remote_addr
+        if not u or not p:
+            return render_template("register.html", error="Fill both fields")
+        db = get_db()
+        if db.execute("SELECT 1 FROM users WHERE username=?", (u,)).fetchone():
+            return render_template("register.html", error="Username taken")
+        db.execute("INSERT INTO users(username,password,signup_ip,created_at) VALUES(?,?,?,?)",
+                   (u, generate_password_hash(p), ip, int(time.time())))
+        db.commit()
         return redirect(url_for("login"))
     return render_template("register.html")
 
@@ -61,193 +84,154 @@ def login():
     if request.method == "POST":
         u = request.form["username"].strip()
         p = request.form["password"]
-        con = db()
-        row = con.execute("SELECT * FROM users WHERE username=?", (u,)).fetchone()
-        con.close()
-        if not row or not check_password_hash(row["password"], p):
-            flash("Invalid credentials.")
-            return redirect(url_for("login"))
-        session.clear()
-        session["uid"] = row["id"]
-        session["is_admin"] = bool(row["is_admin"])
-        return redirect(url_for("admin" if row["is_admin"] else "dashboard"))
+        row = get_db().execute("SELECT * FROM users WHERE username=?", (u,)).fetchone()
+        if row and check_password_hash(row["password"], p):
+            login_user(User(row))
+            return redirect(url_for("admin" if row["is_admin"] else "dashboard"))
+        return render_template("login.html", error="Bad credentials")
     return render_template("login.html")
 
 @app.route("/logout")
+@login_required
 def logout():
-    session.clear()
+    logout_user()
     return redirect(url_for("login"))
 
 @app.route("/dashboard")
+@login_required
 def dashboard():
-    u = current_user()
-    if not u: return redirect(url_for("login"))
-    if u["is_admin"]: return redirect(url_for("admin"))
-    con = db()
-    v = con.execute("SELECT * FROM vps WHERE user_id=?", (u["id"],)).fetchone()
-    con.close()
-    return render_template("dashboard.html", user=u, vps=v)
+    db = get_db()
+    vps = db.execute("SELECT * FROM vps WHERE user_id=?", (current_user.id,)).fetchone()
+    return render_template("dashboard.html", vps=vps)
 
-@app.route("/create_vps", methods=["POST"])
-def create_vps():
-    u = current_user()
-    if not u: return redirect(url_for("login"))
-    ip = client_ip()
-    con = db()
+@app.route("/vps/create", methods=["POST"])
+@login_required
+def vps_create():
+    db = get_db()
+    ip = request.remote_addr
 
-    # farming check: this account already has one
-    existing = con.execute("SELECT id FROM vps WHERE user_id=?", (u["id"],)).fetchone()
-    if existing:
-        con.close()
-        flash("You already own a VPS.")
-        return redirect(url_for("dashboard"))
+    if db.execute("SELECT 1 FROM vps WHERE user_id=?", (current_user.id,)).fetchone():
+        return "You already have a VPS", 403
+    if db.execute("SELECT 1 FROM vps WHERE creator_ip=?", (ip,)).fetchone():
+        return "This IP already owns a VPS", 403
+    user_row = db.execute("SELECT signup_ip FROM users WHERE id=?", (current_user.id,)).fetchone()
+    if db.execute("SELECT 1 FROM vps WHERE creator_ip=?", (user_row["signup_ip"],)).fetchone():
+        return "Your signup IP already owns a VPS", 403
 
-    # farming check: this IP already has a VPS on another account
-    ip_row = con.execute("SELECT user_id FROM ip_vps WHERE ip=?", (ip,)).fetchone()
-    if ip_row and ip_row["user_id"] != u["id"]:
-        con.close()
-        flash("This network already has a VPS registered under a different account.")
-        return redirect(url_for("dashboard"))
+    db.execute("INSERT INTO vps(user_id,container_id,creator_ip,created_at,status) VALUES(?,?,?,?,?)",
+               (current_user.id, "pending", ip, int(time.time()), "creating"))
+    db.commit()
+    vps_id = db.execute("SELECT id FROM vps WHERE user_id=?", (current_user.id,)).fetchone()["id"]
 
-    # farming check: signup IP already tied to a VPS
-    same_ip_user = con.execute(
-        "SELECT v.id FROM vps v JOIN users us ON us.id=v.user_id WHERE us.signup_ip=? AND v.user_id!=?",
-        (u["signup_ip"], u["id"])
-    ).fetchone()
-    if same_ip_user:
-        con.close()
-        flash("Detected multi-account abuse. VPS creation blocked.")
-        return redirect(url_for("dashboard"))
+    threading.Thread(target=_build_vps, args=(vps_id, current_user.id), daemon=True).start()
+    return redirect(url_for("vps_view", vps_id=vps_id))
 
-    con.close()
-    q = queue.Queue()
-    BUILD_LOGS[u["id"]] = q
+def _build_vps(vps_id, user_id):
+    try:
+        cid, ssh = create_vps_container(f"vps-{user_id}")
+        db = get_db()
+        db.execute("UPDATE vps SET container_id=?, ssh_command=?, status='running' WHERE id=?",
+                   (cid, ssh, vps_id))
+        db.commit()
+        db.close()
+    except Exception as e:
+        db = get_db()
+        db.execute("UPDATE vps SET status='failed', ssh_command=? WHERE id=?", (str(e), vps_id))
+        db.commit()
+        db.close()
 
-    def build():
-        try:
-            cid, ssh = vps.create_vps(u["username"], lambda m: q.put(m))
-            con2 = db()
-            con2.execute("INSERT INTO vps(user_id,container_id,tmate_ssh,created_ip) VALUES(?,?,?,?)",
-                         (u["id"], cid, ssh, ip))
-            con2.execute("INSERT OR REPLACE INTO ip_vps(ip,user_id) VALUES(?,?)", (ip, u["id"]))
-            con2.commit()
-            con2.close()
-            q.put("[DONE]")
-        except Exception as ex:
-            q.put(f"[ERROR] {ex}")
-            q.put("[DONE]")
+@app.route("/vps/<int:vps_id>")
+@login_required
+def vps_view(vps_id):
+    db = get_db()
+    vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
+    if not vps or (vps["user_id"] != current_user.id and not current_user.is_admin):
+        return "Not found", 404
+    return render_template("vps_view.html", vps=vps)
 
-    threading.Thread(target=build, daemon=True).start()
-    return redirect(url_for("building"))
+@app.route("/vps/<int:vps_id>/logs")
+@login_required
+def vps_logs(vps_id):
+    db = get_db()
+    vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
+    if not vps or (vps["user_id"] != current_user.id and not current_user.is_admin):
+        return "Not found", 404
 
-@app.route("/building")
-def building():
-    u = current_user()
-    if not u: return redirect(url_for("login"))
-    return render_template("vps_view.html", building=True)
+    @stream_with_context
+    def gen():
+        for line in build_logs_stream(vps_id):
+            yield f"data: {line}\n\n"
+    return Response(gen(), mimetype="text/event-stream")
 
-@app.route("/logs")
-def logs():
-    u = current_user()
-    if not u: return "no", 403
-    def stream():
-        q = BUILD_LOGS.get(u["id"])
-        if not q:
-            yield "data: [no build]\n\n"
-            return
-        while True:
-            msg = q.get()
-            yield f"data: {msg}\n\n"
-            if msg == "[DONE]": break
-    return Response(stream(), mimetype="text/event-stream")
+@app.route("/vps/<int:vps_id>/stats")
+@login_required
+def vps_stats(vps_id):
+    db = get_db()
+    vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
+    if not vps or (vps["user_id"] != current_user.id and not current_user.is_admin):
+        return jsonify({"error": "no"}), 404
+    if vps["status"] != "running":
+        return jsonify({"error": "not running", "status": vps["status"]})
+    try:
+        return jsonify(get_container_stats(vps["container_id"], vps["created_at"]))
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
-@app.route("/vps/stats")
-def vps_stats():
-    u = current_user()
-    if not u: return jsonify({}), 403
-    con = db()
-    v = con.execute("SELECT * FROM vps WHERE user_id=?", (u["id"],)).fetchone()
-    con.close()
-    if not v: return jsonify({})
-    s = vps.stats(v["container_id"])
-    s["ssh"] = v["tmate_ssh"]
-    s["db_status"] = v["status"]
-    return jsonify(s)
-
-# ---------------- ADMIN ----------------
+@app.route("/vps/<int:vps_id>/regen_ssh", methods=["POST"])
+@login_required
+def regen_ssh(vps_id):
+    db = get_db()
+    vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
+    if not vps:
+        return jsonify({"error": "VPS not found"}), 404
+    if vps["user_id"] != current_user.id and not current_user.is_admin:
+        return jsonify({"error": "Not your VPS"}), 403
+    if vps["status"] != "running":
+        return jsonify({"error": "VPS must be running"}), 400
+    if time.time() - vps["last_regen"] < 30:
+        return jsonify({"error": "Wait 30s between regens"}), 429
+    try:
+        new_ssh = regen_tmate(vps["container_id"])
+        db.execute("UPDATE vps SET ssh_command=?, last_regen=? WHERE id=?",
+                   (new_ssh, int(time.time()), vps_id))
+        db.commit()
+        return jsonify({"ssh": new_ssh})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/admin")
+@login_required
 def admin():
-    u = current_user()
-    if not u or not u["is_admin"]: return redirect(url_for("login"))
-    con = db()
-    rows = con.execute("""SELECT v.*, us.username, us.email FROM vps v
-                          JOIN users us ON us.id=v.user_id""").fetchall()
-    users = con.execute("SELECT id,username,email,is_admin,signup_ip,created_at FROM users").fetchall()
-    con.close()
-    live = []
-    for r in rows:
-        s = vps.stats(r["container_id"])
-        live.append({**dict(r), **s})
-    return render_template("admin.html", vpses=live, users=users)
+    if not current_user.is_admin:
+        return "Forbidden", 403
+    db = get_db()
+    rows = db.execute("""SELECT vps.*, users.username FROM vps
+                         JOIN users ON users.id = vps.user_id""").fetchall()
+    users = db.execute("SELECT id, username, signup_ip, is_admin, created_at FROM users").fetchall()
+    return render_template("admin.html", vpses=rows, users=users)
 
-@app.route("/admin/suspend/<int:vid>", methods=["POST"])
-def admin_suspend(vid):
-    u = current_user()
-    if not u or not u["is_admin"]: return "no", 403
-    con = db()
-    row = con.execute("SELECT * FROM vps WHERE id=?", (vid,)).fetchone()
-    if row:
-        vps.suspend(row["container_id"])
-        con.execute("UPDATE vps SET status='suspended' WHERE id=?", (vid,))
-        con.commit()
-    con.close()
-    return redirect(url_for("admin"))
-
-@app.route("/admin/resume/<int:vid>", methods=["POST"])
-def admin_resume(vid):
-    u = current_user()
-    if not u or not u["is_admin"]: return "no", 403
-    con = db()
-    row = con.execute("SELECT * FROM vps WHERE id=?", (vid,)).fetchone()
-    if row:
-        vps.resume(row["container_id"])
-        con.execute("UPDATE vps SET status='running' WHERE id=?", (vid,))
-        con.commit()
-    con.close()
-    return redirect(url_for("admin"))
-
-@app.route("/admin/delete/<int:vid>", methods=["POST"])
-def admin_delete(vid):
-    u = current_user()
-    if not u or not u["is_admin"]: return "no", 403
-    con = db()
-    row = con.execute("SELECT * FROM vps WHERE id=?", (vid,)).fetchone()
-    if row:
-        vps.destroy(row["container_id"])
-        con.execute("DELETE FROM vps WHERE id=?", (vid,))
-        con.execute("DELETE FROM ip_vps WHERE user_id=?", (row["user_id"],))
-        con.commit()
-    con.close()
-    return redirect(url_for("admin"))
-
-@app.route("/admin/user/delete/<int:uid>", methods=["POST"])
-def admin_user_delete(uid):
-    u = current_user()
-    if not u or not u["is_admin"]: return "no", 403
-    if uid == u["id"]:
-        flash("Cannot delete yourself.")
-        return redirect(url_for("admin"))
-    con = db()
-    row = con.execute("SELECT * FROM vps WHERE user_id=?", (uid,)).fetchone()
-    if row:
-        vps.destroy(row["container_id"])
-        con.execute("DELETE FROM vps WHERE user_id=?", (uid,))
-    con.execute("DELETE FROM ip_vps WHERE user_id=?", (uid,))
-    con.execute("DELETE FROM users WHERE id=?", (uid,))
-    con.commit()
-    con.close()
+@app.route("/admin/vps/<int:vps_id>/<action>", methods=["POST"])
+@login_required
+def admin_vps_action(vps_id, action):
+    if not current_user.is_admin:
+        return "Forbidden", 403
+    db = get_db()
+    vps = db.execute("SELECT * FROM vps WHERE id=?", (vps_id,)).fetchone()
+    if not vps:
+        return "Not found", 404
+    if action == "suspend":
+        suspend_vps(vps["container_id"])
+        db.execute("UPDATE vps SET status='suspended' WHERE id=?", (vps_id,))
+    elif action == "unsuspend":
+        unsuspend_vps(vps["container_id"])
+        db.execute("UPDATE vps SET status='running' WHERE id=?", (vps_id,))
+    elif action == "delete":
+        destroy_vps(vps["container_id"])
+        db.execute("DELETE FROM vps WHERE id=?", (vps_id,))
+    db.commit()
     return redirect(url_for("admin"))
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    init_db()
+    start_monitor()
+    app.run(host="0.0.0.0", port=5000, threaded=True)
