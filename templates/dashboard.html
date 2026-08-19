@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="card">
+<h2>Welcome, {{ user.username }}</h2>
+<p>Plan: 32GB RAM · 4 vCPU · 80GB Disk (1 VPS per account)</p>
+</div>
+
+{% if not vps %}
+<div class="card">
+  <h3>No VPS yet</h3>
+  <form method="post" action="/create_vps">
+    <button type="submit">Create Free VPS</button>
+  </form>
+</div>
+{% else %}
+<div class="card">
+  <h3>Your VPS</h3>
+  <div id="stats">Loading...</div>
+  <p><b>SSH:</b> <code id="ssh">{{ vps.tmate_ssh }}</code></p>
+  <p><b>Status:</b> <span id="status">{{ vps.status }}</span></p>
+</div>
+<script>
+async function upd(){
+  const r = await fetch('/vps/stats');
+  const d = await r.json();
+  if(!d.status){document.getElementById('stats').innerText='No data';return}
+  document.getElementById('stats').innerHTML =
+    `<span class="stat">CPU: <b>${d.cpu}%</b></span>
+     <span class="stat">RAM: <b>${d.ram} / ${d.ram_limit} MB</b></span>
+     <span class="stat">Uptime start: <b>${d.uptime}</b></span>`;
+  document.getElementById('status').innerText = d.db_status || d.status;
+  if(d.ssh) document.getElementById('ssh').innerText = d.ssh;
+}
+upd(); setInterval(upd,5000);
+</script>
+{% endif %}
+{% endblock %}
