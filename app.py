@@ -159,7 +159,8 @@ def vps_logs(vps_id):
 
     @stream_with_context
     def gen():
-        for line in build_logs_stream(vps_id):
+        # NOTE: was build_logs_stream(vps_id) — must pass the container_id, not the DB row id
+        for line in build_logs_stream(vps["container_id"]):
             yield f"data: {line}\n\n"
     return Response(gen(), mimetype="text/event-stream")
 
